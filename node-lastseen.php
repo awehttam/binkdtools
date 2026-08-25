@@ -7,6 +7,13 @@
  * binkd.log.2.gz, ...) and reports, per node, when it was last (and first) in
  * contact, its last direction/status, and how many sessions were seen.
  *
+ * "Seen" requires confirmed contact — an addr: line or a done (...) line
+ * (protocol.c, written only once a session actually connects). A bare
+ * "call to <addr>" (client.c:362) is logged before the connection attempt
+ * even happens, so a node binkd keeps dialing but can't reach — e.g. it's
+ * down — would otherwise look freshly "seen" on every retry. Those dial-only
+ * attempts are tracked separately and shown as "Last Attempt".
+ *
  * binkd log lines omit the year (tools.c:vLog), so rotated logs are stitched
  * together oldest-first and the year is reconstructed by watching for the
  * month counter wrapping backwards (Dec -> Jan).
@@ -198,7 +205,7 @@ foreach ($files as $path) {
             $sessions[$pid] = [
                 'start' => $ts, 'end' => $ts,
                 'direction' => null, 'status' => null,
-                'node_addr' => null,
+                'node_addr' => null, 'confirmed' => false,
             ];
         }
         $sess = &$sessions[$pid];
@@ -213,6 +220,7 @@ foreach ($files as $path) {
 
         } elseif (preg_match('/^addr: (\S+)/', $msg, $m)) {
             $sess['node_addr'] = $sess['node_addr'] ?? rtrim($m[1], ',');
+            $sess['confirmed'] = true;
 
         } elseif (preg_match(
             '/^done \((?:(to|from) )?([^\s,]+), (OK|failed), S\/R: (\d+)\/(\d+) \((\d+)\/(\d+) bytes\)\)/',
@@ -221,6 +229,7 @@ foreach ($files as $path) {
             $sess['node_addr'] = $sess['node_addr'] ?? $m[2];
             if ($m[1]) $sess['direction'] = ($m[1] === 'to') ? 'out' : 'in';
             $sess['status'] = strtolower($m[3]);
+            $sess['confirmed'] = true;
         }
 
         unset($sess);
@@ -229,6 +238,9 @@ foreach ($files as $path) {
 }
 
 // ---- Aggregate sessions into per-node last-seen stats -----------------------
+// "Seen" tracks confirmed contact only; dial-only attempts (call to <addr>
+// with no addr:/done line — e.g. the node was down) are tracked separately
+// as "last attempt" and don't count as sessions or move last-seen forward.
 
 $nodes = [];
 
@@ -239,21 +251,31 @@ foreach ($sessions as $sess) {
     if (!isset($nodes[$norm])) {
         $nodes[$norm] = [
             'raw' => $sess['node_addr'],
-            'first_ts' => $sess['start'],
-            'last_ts' => $sess['start'],
-            'direction' => $sess['direction'],
-            'status' => $sess['status'],
+            'first_ts' => null,
+            'last_ts' => null,
+            'direction' => null,
+            'status' => null,
             'sessions' => 0,
+            'attempt_ts' => $sess['start'],
+            'attempt_raw' => $sess['node_addr'],
         ];
     }
     $n = &$nodes[$norm];
-    $n['sessions']++;
-    if ($sess['start'] < $n['first_ts']) $n['first_ts'] = $sess['start'];
-    if ($sess['start'] >= $n['last_ts']) {
-        $n['last_ts']    = $sess['start'];
-        $n['raw']        = $sess['node_addr'];
-        $n['direction']  = $sess['direction'];
-        $n['status']     = $sess['status'];
+
+    if ($sess['start'] >= $n['attempt_ts']) {
+        $n['attempt_ts']  = $sess['start'];
+        $n['attempt_raw'] = $sess['node_addr'];
+    }
+
+    if ($sess['confirmed']) {
+        $n['sessions']++;
+        if ($n['first_ts'] === null || $sess['start'] < $n['first_ts']) $n['first_ts'] = $sess['start'];
+        if ($n['last_ts'] === null || $sess['start'] >= $n['last_ts']) {
+            $n['last_ts']    = $sess['start'];
+            $n['raw']        = $sess['node_addr'];
+            $n['direction']  = $sess['direction'];
+            $n['status']     = $sess['status'];
+        }
     }
     unset($n);
 }
@@ -261,7 +283,7 @@ foreach ($sessions as $sess) {
 if ($sortAlpha) {
     ksort($nodes);
 } else {
-    uasort($nodes, fn($a, $b) => $b['last_ts'] <=> $a['last_ts']);
+    uasort($nodes, fn($a, $b) => ($b['last_ts'] ?? -1) <=> ($a['last_ts'] ?? -1));
 }
 
 if ($limit > 0) {
@@ -276,19 +298,28 @@ echo "  Node Last-Seen Report\n";
 echo "  Logs: " . implode(', ', array_reverse($files)) . "\n";
 echo "$sep\n\n";
 
-printf("  %s %s %s %s %s\n",
-    col('Node', 15), col('Last Seen', 19), col('Dir', 3), col('Status', 6), col('Sessions', 8));
-echo '  ' . str_repeat('-', 58) . "\n";
+printf("  %s %s %s %s %s %s\n",
+    col('Node', 15), col('Last Seen', 19), col('Dir', 3), col('Status', 6),
+    col('Sessions', 8), col('Last Attempt', 19));
+echo '  ' . str_repeat('-', 78) . "\n";
 
 foreach ($nodes as $n) {
-    $dir = match($n['direction']) { 'out' => 'OUT', 'in' => 'IN', default => '?' };
-    $st  = match($n['status'])    { 'ok' => 'OK', 'failed' => 'FAIL', default => '?' };
-    printf("  %s %s %s %s %s\n",
+    $dir = match($n['direction']) { 'out' => 'OUT', 'in' => 'IN', default => '-' };
+    $st  = match($n['status'])    { 'ok' => 'OK', 'failed' => 'FAIL', default => '-' };
+    $lastSeen = $n['last_ts'] !== null ? fmtDt($n['last_ts']) : 'never';
+
+    // Only show an attempt separately when it's a dial that never connected
+    // (i.e. more recent than the last confirmed contact, or there was none).
+    $showAttempt = $n['last_ts'] === null || $n['attempt_ts'] > $n['last_ts'];
+    $attemptStr  = $showAttempt ? fmtDt($n['attempt_ts']) : '-';
+
+    printf("  %s %s %s %s %s %s\n",
         col($n['raw'], 15),
-        col(fmtDt($n['last_ts']), 19),
+        col($lastSeen, 19),
         col($dir, 3),
         col($st, 6),
-        col((string)$n['sessions'], 8)
+        col((string)$n['sessions'], 8),
+        col($attemptStr, 19)
     );
 }
 

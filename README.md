@@ -75,6 +75,8 @@ Raw mode (`-r`) is useful for piping: `php node-grep.php -r -f binkd.log 1:17/22
 
 Reports the last-seen date/time for every node across binkd.log and its rotated/gzipped predecessors. Since binkd's log lines omit the year, rotated logs are stitched together oldest-first and the year is reconstructed by watching the month counter wrap backwards (Dec -> Jan).
 
+"Seen" requires confirmed contact (an `addr:` or `done (...)` line). A bare `call to <addr>` is logged before the connection attempt even completes, so a down node binkd keeps dialing won't look freshly "seen" on every failed retry — those dial-only attempts are tracked separately and shown in the **Last Attempt** column instead.
+
 ```
 php node-lastseen.php [options]
 
@@ -93,12 +95,13 @@ By default, searches for `binkd.log` and rotated predecessors `binkd.log.0` thro
   Logs: binkd.log, binkd.log.0, binkd.log.1, binkd.log.2.gz
 ============================================================
 
-  Node            Last Seen           Dir Status Sessions
-  ----------------------------------------------------------
-  1:17/227        2024-06-28 14:23:01 OUT OK     42
-  1:18/100        2024-06-20 09:12:44 IN  FAIL   3
+  Node            Last Seen           Dir Status Sessions Last Attempt
+  ------------------------------------------------------------------------------
+  1:17/227        2024-06-28 14:23:01 OUT OK     42       -
+  1:18/100        2024-06-20 09:12:44 IN  FAIL   3        -
+  1:19/50         never               -   -      0        2024-06-27 03:00:01
 
-  2 node(s)
+  3 node(s)
 ```
 
 ## Log format
