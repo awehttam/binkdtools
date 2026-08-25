@@ -69,6 +69,38 @@ php node-grep.php [options] <node>
 
 Raw mode (`-r`) is useful for piping: `php node-grep.php -r -f binkd.log 1:17/227 | grep sent`
 
+---
+
+### node-lastseen.php
+
+Reports the last-seen date/time for every node across binkd.log and its rotated/gzipped predecessors. Since binkd's log lines omit the year, rotated logs are stitched together oldest-first and the year is reconstructed by watching the month counter wrap backwards (Dec -> Jan).
+
+```
+php node-lastseen.php [options]
+
+  -f file     Log file to include (repeatable), newest-first. Overrides default search.
+  -d dir      Directory to search for default log files in (default: .)
+  -n count    Limit output to N nodes
+  -s          Sort alphabetically by node address (default: most recent first)
+```
+
+By default, searches for `binkd.log` and rotated predecessors `binkd.log.0` through `binkd.log.60` (and `.gz` variants of each) in the standard binkd log locations.
+
+**Example output:**
+```
+============================================================
+  Node Last-Seen Report
+  Logs: binkd.log, binkd.log.0, binkd.log.1, binkd.log.2.gz
+============================================================
+
+  Node            Last Seen           Dir Status Sessions
+  ----------------------------------------------------------
+  1:17/227        2024-06-28 14:23:01 OUT OK     42
+  1:18/100        2024-06-20 09:12:44 IN  FAIL   3
+
+  2 node(s)
+```
+
 ## Log format
 
 binkd writes log lines in this format (see `tools.c:vLog`):
@@ -90,4 +122,5 @@ Sessions are identified by PID. All lines belonging to the same session share a 
 ## Requirements
 
 - PHP 8.0+ (CLI)
+- PHP zlib extension (for reading `.gz` rotated logs, used by `node-lastseen.php`)
 - A binkd log file
