@@ -27,8 +27,9 @@ Usage: php $prog [options]
   -n count    Limit output to N nodes
   -s          Sort alphabetically by node address (default: most recent first)
 
-By default, searches for binkd.log, binkd.log.0, binkd.log.1, binkd.log.2.gz
-(and .gz variants of .0/.1) in the standard binkd log locations.
+By default, searches for binkd.log and rotated predecessors binkd.log.0
+through binkd.log.60 (and .gz variants of each) in the standard binkd
+log locations.
 
 USAGE;
     exit(1);
@@ -107,10 +108,18 @@ if ($explicitFiles) {
     $files = array_reverse($explicitFiles);
 } else {
     $dirs = isset($opts['d']) ? [$opts['d']] : ['.', '/var/log/binkd', '/var/log'];
-    // Search order requested: binkd.log, .0, .1, .2.gz — but for year
+    // binkd rotates logs as binkd.log, .0, .1, .2, ... (weekly, so up to ~52
+    // may exist), gzipping older ones at its own discretion. For year
     // reconstruction we need oldest-first, so build the chronological list
-    // from whichever directory actually has the logs.
-    $chronological = ['binkd.log.2.gz', 'binkd.log.1', 'binkd.log.1.gz', 'binkd.log.0', 'binkd.log.0.gz', 'binkd.log'];
+    // (highest rotation number first, binkd.log last) from whichever
+    // directory actually has the logs.
+    $maxRotation = 60;
+    $chronological = [];
+    for ($i = $maxRotation; $i >= 0; $i--) {
+        $chronological[] = "binkd.log.$i.gz";
+        $chronological[] = "binkd.log.$i";
+    }
+    $chronological[] = 'binkd.log';
     foreach ($dirs as $dir) {
         $found = [];
         foreach ($chronological as $name) {
