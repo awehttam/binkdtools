@@ -135,9 +135,10 @@ if (!$files) {
     exit(1);
 }
 
-// ---- Pass 1: read all files oldest-first, reconstruct the year -------------
+// ---- Pass 1: read all files oldest-first, just to count year rollovers -----
+// Streamed — nothing is kept, so this pass is cheap regardless of log size.
 
-$records = [];   // ['ts_year_rel' => int, 'day','mon','time','pid','msg']
+$monRe = '/^[!?+\- ] \d{2} ([A-Za-z]{3}) /';
 $prevMon = null;
 $relYear = 0;
 
@@ -148,6 +149,37 @@ foreach ($files as $path) {
         continue;
     }
     while (($line = logGets($fh)) !== false) {
+        if (!preg_match($monRe, $line, $m)) continue;
+        $monNum = MONTHS[strtolower($m[1])] ?? 1;
+        if ($prevMon !== null && $monNum < $prevMon) {
+            $relYear++;
+        }
+        $prevMon = $monNum;
+    }
+    logClose($fh);
+}
+
+if ($prevMon === null) {
+    fwrite(STDERR, "No parsable log lines found.\n");
+    exit(0);
+}
+
+$maxRelYear = $relYear;
+$currentYear = (int)date('Y');
+
+// ---- Pass 2: re-read the same files, rebuilding per-PID sessions -----------
+// The month-wrap detection is deterministic given the same line sequence, so
+// re-running it here (instead of caching pass 1's results) reproduces the
+// exact same rel_year per line without holding every line in memory.
+
+$sessions = [];
+$prevMon = null;
+$relYear = 0;
+
+foreach ($files as $path) {
+    $fh = logOpen($path);
+    if (!$fh) continue;
+    while (($line = logGets($fh)) !== false) {
         $p = parseLine(rtrim($line, "\r\n"));
         if ($p === null) continue;
 
@@ -157,60 +189,43 @@ foreach ($files as $path) {
         }
         $prevMon = $monNum;
 
-        $p['rel_year'] = $relYear;
-        $records[] = $p;
+        $year = $currentYear - ($maxRelYear - $relYear);
+        $ts   = toTimestamp($p, $year);
+        $pid  = $p['pid'];
+        $msg  = $p['msg'];
+
+        if (!isset($sessions[$pid])) {
+            $sessions[$pid] = [
+                'start' => $ts, 'end' => $ts,
+                'direction' => null, 'status' => null,
+                'node_addr' => null,
+            ];
+        }
+        $sess = &$sessions[$pid];
+        if ($ts > $sess['end']) $sess['end'] = $ts;
+
+        if (preg_match('/^call to (\S+)$/', $msg, $m)) {
+            $sess['direction'] = 'out';
+            $sess['node_addr'] = $sess['node_addr'] ?? rtrim($m[1], ',');
+
+        } elseif (preg_match('/^(outgoing|incoming) session with /', $msg, $m)) {
+            $sess['direction'] = $m[1] === 'outgoing' ? 'out' : 'in';
+
+        } elseif (preg_match('/^addr: (\S+)/', $msg, $m)) {
+            $sess['node_addr'] = $sess['node_addr'] ?? rtrim($m[1], ',');
+
+        } elseif (preg_match(
+            '/^done \((?:(to|from) )?([^\s,]+), (OK|failed), S\/R: (\d+)\/(\d+) \((\d+)\/(\d+) bytes\)\)/',
+            $msg, $m
+        )) {
+            $sess['node_addr'] = $sess['node_addr'] ?? $m[2];
+            if ($m[1]) $sess['direction'] = ($m[1] === 'to') ? 'out' : 'in';
+            $sess['status'] = strtolower($m[3]);
+        }
+
+        unset($sess);
     }
     logClose($fh);
-}
-
-if (!$records) {
-    fwrite(STDERR, "No parsable log lines found.\n");
-    exit(0);
-}
-
-$maxRelYear = $relYear;
-$currentYear = (int)date('Y');
-
-// ---- Pass 2: rebuild per-PID sessions, tracking node address/status --------
-
-$sessions = [];
-
-foreach ($records as $p) {
-    $year = $currentYear - ($maxRelYear - $p['rel_year']);
-    $ts   = toTimestamp($p, $year);
-    $pid  = $p['pid'];
-    $msg  = $p['msg'];
-
-    if (!isset($sessions[$pid])) {
-        $sessions[$pid] = [
-            'start' => $ts, 'end' => $ts,
-            'direction' => null, 'status' => null,
-            'node_addr' => null,
-        ];
-    }
-    $sess = &$sessions[$pid];
-    if ($ts > $sess['end']) $sess['end'] = $ts;
-
-    if (preg_match('/^call to (\S+)$/', $msg, $m)) {
-        $sess['direction'] = 'out';
-        $sess['node_addr'] = $sess['node_addr'] ?? rtrim($m[1], ',');
-
-    } elseif (preg_match('/^(outgoing|incoming) session with /', $msg, $m)) {
-        $sess['direction'] = $m[1] === 'outgoing' ? 'out' : 'in';
-
-    } elseif (preg_match('/^addr: (\S+)/', $msg, $m)) {
-        $sess['node_addr'] = $sess['node_addr'] ?? rtrim($m[1], ',');
-
-    } elseif (preg_match(
-        '/^done \((?:(to|from) )?([^\s,]+), (OK|failed), S\/R: (\d+)\/(\d+) \((\d+)\/(\d+) bytes\)\)/',
-        $msg, $m
-    )) {
-        $sess['node_addr'] = $sess['node_addr'] ?? $m[2];
-        if ($m[1]) $sess['direction'] = ($m[1] === 'to') ? 'out' : 'in';
-        $sess['status'] = strtolower($m[3]);
-    }
-
-    unset($sess);
 }
 
 // ---- Aggregate sessions into per-node last-seen stats -----------------------
